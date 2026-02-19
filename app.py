@@ -1929,6 +1929,36 @@ def main():
         </style>
     """, unsafe_allow_html=True)
     
+    # JavaScript pour colorer les checkboxes
+    st.markdown("""
+        <script>
+        // Colorer les checkboxes après le chargement de la page
+        function colorCheckboxes() {
+            // Sélectionner tous les labels de checkboxes
+            const checkboxes = document.querySelectorAll('div[data-testid="stCheckbox"] label');
+            checkboxes.forEach(label => {
+                const text = label.textContent || label.innerText;
+                if (text.includes('✓ Oui') || text.includes('✓ Positif') || text.includes('✓ Positive')) {
+                    label.style.color = '#28a745';
+                    label.style.fontWeight = '500';
+                } else if (text.includes('✗ Non') || text.includes('✗ Négatif') || text.includes('✗ Négative')) {
+                    label.style.color = '#dc3545';
+                    label.style.fontWeight = '500';
+                }
+            });
+        }
+        // Exécuter au chargement et après chaque interaction Streamlit
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', colorCheckboxes);
+        } else {
+            colorCheckboxes();
+        }
+        // Réexécuter après les mises à jour Streamlit
+        const observer = new MutationObserver(colorCheckboxes);
+        observer.observe(document.body, { childList: true, subtree: true });
+        </script>
+    """, unsafe_allow_html=True)
+    
     ensure_dirs()
     init_db()
     
