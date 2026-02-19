@@ -4,6 +4,7 @@ import uuid
 import sqlite3
 import random
 import string
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -16,23 +17,73 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
 
 APP_TITLE = "RCP Bandelette — saisie structurée (offline)"
-DB_PATH = os.path.join("data", "rcp_bandelette.sqlite")
-EXPORT_DIR = os.path.join("exports")
-PDF_DIR = os.path.join(EXPORT_DIR, "pdf")
-CSV_DIR = os.path.join(EXPORT_DIR, "csv")
+
+# Chemins configurables via variables d'environnement
+APP_DATA_DIR = os.getenv("APP_DATA_DIR", "data")
+APP_EXPORT_DIR = os.getenv("APP_EXPORT_DIR", "exports")
+DB_PATH = os.path.join(APP_DATA_DIR, "rcp_bandelette.sqlite")
+PDF_DIR = os.path.join(APP_EXPORT_DIR, "pdf")
+CSV_DIR = os.path.join(APP_EXPORT_DIR, "csv")
 
 
 # ---------------------------
 # Utils: filesystem & database
 # ---------------------------
 def ensure_dirs():
-    os.makedirs("data", exist_ok=True)
+    """Crée les dossiers nécessaires s'ils n'existent pas."""
+    os.makedirs(APP_DATA_DIR, exist_ok=True)
     os.makedirs(PDF_DIR, exist_ok=True)
     os.makedirs(CSV_DIR, exist_ok=True)
 
 
 def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    """Obtient une connexion SQLite avec optimisations."""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    cur = conn.cursor()
+    # Activer WAL mode pour meilleures performances en lecture/écriture concurrente
+    cur.execute("PRAGMA journal_mode=WAL")
+    # Timeout pour gérer les verrous de base de données
+    cur.execute("PRAGMA busy_timeout=5000")
+    # Activer les clés étrangères
+    cur.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def db_write(fn, retries=5):
+    """
+    Exécute une fonction d'écriture avec retry exponentiel en cas d'erreur de verrouillage.
+    
+    Args:
+        fn: Fonction qui prend une connexion et un curseur en paramètres et retourne un résultat
+        retries: Nombre de tentatives (défaut: 5)
+    
+    Returns:
+        Le résultat de la fonction fn
+    
+    Raises:
+        sqlite3.OperationalError: Si toutes les tentatives échouent
+    """
+    for attempt in range(retries):
+        try:
+            conn = get_conn()
+            try:
+                cur = conn.cursor()
+                result = fn(conn, cur)
+                conn.commit()
+                return result
+            finally:
+                conn.close()
+        except sqlite3.OperationalError as e:
+            error_msg = str(e).lower()
+            if 'locked' in error_msg or 'busy' in error_msg:
+                if attempt < retries - 1:
+                    # Backoff exponentiel : 0.01s, 0.02s, 0.04s, 0.08s, 0.16s
+                    wait_time = 0.01 * (2 ** attempt)
+                    time.sleep(wait_time)
+                    continue
+            # Si ce n'est pas une erreur de verrouillage, ou si on a épuisé les tentatives, relancer
+            raise
+    raise sqlite3.OperationalError("Échec après toutes les tentatives de retry")
 
 
 def generate_rcp_code() -> str:
@@ -53,6 +104,7 @@ def generate_rcp_code() -> str:
 
 def migrate_db():
     """Migre la base de données depuis l'ancienne structure vers la nouvelle."""
+    # Lecture seule pour vérifier la structure
     conn = get_conn()
     cur = conn.cursor()
     
@@ -65,95 +117,104 @@ def migrate_db():
     columns = [col[1] for col in cur.fetchall()]
     has_rcp_code = "rcp_code" in columns
     
-    if not rcp_exists:
-        # Créer la table RCP
+    conn.close()
+    
+    # Écritures avec retry
+    def _migrate_tables(conn, cur):
+        if not rcp_exists:
+            # Créer la table RCP
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rcp (
+                    code TEXT PRIMARY KEY,
+                    date_rcp TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+        else:
+            # Vérifier si la colonne date_rcp existe
+            cur.execute("PRAGMA table_info(rcp)")
+            rcp_columns = [col[1] for col in cur.fetchall()]
+            if "date_rcp" not in rcp_columns:
+                cur.execute("ALTER TABLE rcp ADD COLUMN date_rcp TEXT")
+            # Vérifier si la colonne is_archived existe
+            if "is_archived" not in rcp_columns:
+                cur.execute("ALTER TABLE rcp ADD COLUMN is_archived INTEGER DEFAULT 0")
+            # Vérifier si la colonne medecins_presents existe
+            if "medecins_presents" not in rcp_columns:
+                cur.execute("ALTER TABLE rcp ADD COLUMN medecins_presents TEXT")
+    
+    db_write(_migrate_tables)
+    
+    if not has_rcp_code:
+        # Générer un code RCP unique pour les fiches existantes
+        chars = string.ascii_uppercase + string.digits
+        default_rcp_code = None
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            for _ in range(100):  # Essayer jusqu'à 100 fois
+                code = ''.join(random.choices(chars, k=6))
+                cur.execute("SELECT code FROM rcp WHERE code = ?", (code,))
+                if cur.fetchone() is None:
+                    default_rcp_code = code
+                    break
+        finally:
+            conn.close()
+        
+        if default_rcp_code:
+            def _migrate_rcp_code(conn, cur):
+                now = datetime.now().isoformat(timespec="seconds")
+                cur.execute(
+                    "INSERT INTO rcp (code, created_at, updated_at) VALUES (?, ?, ?)",
+                    (default_rcp_code, now, now)
+                )
+                
+                # Ajouter la colonne rcp_code
+                cur.execute(f"ALTER TABLE fiches ADD COLUMN rcp_code TEXT")
+                cur.execute(f"UPDATE fiches SET rcp_code = ? WHERE rcp_code IS NULL", (default_rcp_code,))
+            
+            db_write(_migrate_rcp_code)
+
+
+def init_db():
+    def _init_tables(conn, cur):
+        # Table RCP (dossiers)
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS rcp (
                 code TEXT PRIMARY KEY,
                 date_rcp TEXT,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                is_archived INTEGER DEFAULT 0,
+                medecins_presents TEXT
             )
             """
         )
-    else:
-        # Vérifier si la colonne date_rcp existe
-        cur.execute("PRAGMA table_info(rcp)")
-        rcp_columns = [col[1] for col in cur.fetchall()]
-        if "date_rcp" not in rcp_columns:
-            cur.execute("ALTER TABLE rcp ADD COLUMN date_rcp TEXT")
-        # Vérifier si la colonne is_archived existe
-        if "is_archived" not in rcp_columns:
-            cur.execute("ALTER TABLE rcp ADD COLUMN is_archived INTEGER DEFAULT 0")
-        # Vérifier si la colonne medecins_presents existe
-        if "medecins_presents" not in rcp_columns:
-            cur.execute("ALTER TABLE rcp ADD COLUMN medecins_presents TEXT")
-    
-    if not has_rcp_code:
-        # Générer un code RCP unique pour les fiches existantes
-        chars = string.ascii_uppercase + string.digits
-        default_rcp_code = None
-        for _ in range(100):  # Essayer jusqu'à 100 fois
-            code = ''.join(random.choices(chars, k=6))
-            cur.execute("SELECT code FROM rcp WHERE code = ?", (code,))
-            if cur.fetchone() is None:
-                default_rcp_code = code
-                break
-        
-        if default_rcp_code:
-            now = datetime.now().isoformat(timespec="seconds")
-            cur.execute(
-                "INSERT INTO rcp (code, created_at, updated_at) VALUES (?, ?, ?)",
-                (default_rcp_code, now, now)
+        # Table fiches (liées aux RCP)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fiches (
+                id TEXT PRIMARY KEY,
+                rcp_code TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                FOREIGN KEY (rcp_code) REFERENCES rcp(code)
             )
-            
-            # Ajouter la colonne rcp_code
-            cur.execute(f"ALTER TABLE fiches ADD COLUMN rcp_code TEXT")
-            cur.execute(f"UPDATE fiches SET rcp_code = ? WHERE rcp_code IS NULL", (default_rcp_code,))
-    
-    conn.commit()
-    conn.close()
-
-
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-    # Table RCP (dossiers)
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS rcp (
-            code TEXT PRIMARY KEY,
-            date_rcp TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            is_archived INTEGER DEFAULT 0,
-            medecins_presents TEXT
+            """
         )
-        """
-    )
-    # Table fiches (liées aux RCP)
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS fiches (
-            id TEXT PRIMARY KEY,
-            rcp_code TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            payload_json TEXT NOT NULL,
-            FOREIGN KEY (rcp_code) REFERENCES rcp(code)
-        )
-        """
-    )
+        
+        # Créer des index pour accélérer les requêtes fréquentes
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_fiches_rcp_code ON fiches(rcp_code)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_fiches_updated_at ON fiches(updated_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_rcp_date_rcp ON rcp(date_rcp)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_rcp_updated_at ON rcp(updated_at)")
     
-    # Créer des index pour accélérer les requêtes fréquentes
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_fiches_rcp_code ON fiches(rcp_code)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_fiches_updated_at ON fiches(updated_at)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_rcp_date_rcp ON rcp(date_rcp)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_rcp_updated_at ON rcp(updated_at)")
-    
-    conn.commit()
-    conn.close()
+    db_write(_init_tables)
 
     # Migrer si nécessaire
     migrate_db()
@@ -163,18 +224,16 @@ def create_rcp(date_rcp: str) -> str:
     """Crée une nouvelle RCP avec une date et retourne son code."""
     code = generate_rcp_code()
     now = datetime.now().isoformat(timespec="seconds")
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
+    
+    def _create_rcp(conn, cur):
         cur.execute(
             "INSERT INTO rcp (code, date_rcp, created_at, updated_at) VALUES (?, ?, ?, ?)",
             (code, date_rcp, now, now)
         )
-        conn.commit()
-        # Invalider le cache
-        get_all_rcp.clear()
-    finally:
-        conn.close()
+    
+    db_write(_create_rcp)
+    # Invalider le cache
+    get_all_rcp.clear()
     return code
 
 
@@ -224,60 +283,59 @@ def get_rcp_medecins_presents(rcp_code: str) -> str:
 
 def update_rcp_medecins_presents(rcp_code: str, medecins_presents: str):
     """Met à jour la liste des médecins présents d'une RCP."""
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        now = datetime.now().isoformat(timespec="seconds")
+    now = datetime.now().isoformat(timespec="seconds")
+    
+    def _update_medecins(conn, cur):
         cur.execute(
             "UPDATE rcp SET medecins_presents = ?, updated_at = ? WHERE code = ?",
             (medecins_presents, now, rcp_code)
         )
-        conn.commit()
-        # Invalider le cache
-        get_all_rcp.clear()
-    finally:
-        conn.close()
+    
+    db_write(_update_medecins)
+    # Invalider le cache
+    get_all_rcp.clear()
 
 
 def archive_rcp(rcp_code: str, archived: bool = True):
     """Archive ou désarchive une RCP."""
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        now = datetime.now().isoformat(timespec="seconds")
+    now = datetime.now().isoformat(timespec="seconds")
+    
+    def _archive_rcp(conn, cur):
         cur.execute(
             "UPDATE rcp SET is_archived = ?, updated_at = ? WHERE code = ?",
             (1 if archived else 0, now, rcp_code)
         )
-        conn.commit()
-        # Invalider le cache
-        get_all_rcp.clear()
-    finally:
-        conn.close()
+    
+    db_write(_archive_rcp)
+    # Invalider le cache
+    get_all_rcp.clear()
 
 
 def delete_rcp(rcp_code: str):
     """Supprime une RCP et toutes ses fiches."""
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
+    def _delete_rcp(conn, cur):
         cur.execute("DELETE FROM fiches WHERE rcp_code = ?", (rcp_code,))
         cur.execute("DELETE FROM rcp WHERE code = ?", (rcp_code,))
-        conn.commit()
-        # Invalider le cache
-        get_all_rcp.clear()
-        load_fiches.clear()
-    finally:
-        conn.close()
+    
+    db_write(_delete_rcp)
+    # Invalider le cache
+    get_all_rcp.clear()
+    load_fiches.clear()
 
 
 def upsert_fiche(fiche_id: str, rcp_code: str, payload: dict):
     now = datetime.now().isoformat(timespec="seconds")
+    
+    # Vérifier si la fiche existe (lecture seule)
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute("SELECT id FROM fiches WHERE id = ?", (fiche_id,))
         exists = cur.fetchone() is not None
+    finally:
+        conn.close()
+    
+    def _upsert_fiche(conn, cur):
         if exists:
             cur.execute(
                 "UPDATE fiches SET updated_at = ?, payload_json = ? WHERE id = ?",
@@ -290,12 +348,11 @@ def upsert_fiche(fiche_id: str, rcp_code: str, payload: dict):
             )
         # Mettre à jour la date de modification de la RCP
         cur.execute("UPDATE rcp SET updated_at = ? WHERE code = ?", (now, rcp_code))
-        conn.commit()
-        # Invalider le cache
-        get_all_rcp.clear()
-        load_fiches.clear()
-    finally:
-        conn.close()
+    
+    db_write(_upsert_fiche)
+    # Invalider le cache
+    get_all_rcp.clear()
+    load_fiches.clear()
 
 
 @st.cache_data(ttl=2)  # Cache pendant 2 secondes
@@ -335,6 +392,7 @@ def get_fiche_by_id(fiche_id: str) -> dict:
 
 def transfer_fiche(fiche_id: str, target_rcp_code: str):
     """Transfère une fiche vers une autre RCP."""
+    # Vérifications en lecture seule
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -351,47 +409,52 @@ def transfer_fiche(fiche_id: str, target_rcp_code: str):
         cur.execute("SELECT code FROM rcp WHERE code = ?", (target_rcp_code,))
         if cur.fetchone() is None:
             return False
-        
+    finally:
+        conn.close()
+    
+    # Écriture avec retry
+    now = datetime.now().isoformat(timespec="seconds")
+    
+    def _transfer_fiche(conn, cur):
         # Transférer la fiche
-        now = datetime.now().isoformat(timespec="seconds")
         cur.execute("UPDATE fiches SET rcp_code = ?, updated_at = ? WHERE id = ?", (target_rcp_code, now, fiche_id))
         
         # Mettre à jour les dates de modification des deux RCP
         cur.execute("UPDATE rcp SET updated_at = ? WHERE code = ?", (now, source_rcp_code))
         cur.execute("UPDATE rcp SET updated_at = ? WHERE code = ?", (now, target_rcp_code))
-        
-        conn.commit()
-        # Invalider le cache
-        get_all_rcp.clear()
-        load_fiches.clear()
-        return True
-    finally:
-        conn.close()
+    
+    db_write(_transfer_fiche)
+    # Invalider le cache
+    get_all_rcp.clear()
+    load_fiches.clear()
+    return True
 
 
 def delete_fiche(fiche_id: str):
     """Supprime une fiche et met à jour la date de modification de la RCP."""
+    # Récupérer le code RCP avant suppression (lecture seule)
     conn = get_conn()
     try:
         cur = conn.cursor()
-        # Récupérer le code RCP avant suppression
         cur.execute("SELECT rcp_code FROM fiches WHERE id = ?", (fiche_id,))
         res = cur.fetchone()
         rcp_code = res[0] if res else None
-        
+    finally:
+        conn.close()
+    
+    # Écriture avec retry
+    def _delete_fiche(conn, cur):
         cur.execute("DELETE FROM fiches WHERE id = ?", (fiche_id,))
         
         # Mettre à jour la date de modification de la RCP
         if rcp_code:
             now = datetime.now().isoformat(timespec="seconds")
             cur.execute("UPDATE rcp SET updated_at = ? WHERE code = ?", (now, rcp_code))
-        
-        conn.commit()
-        # Invalider le cache
-        get_all_rcp.clear()
-        load_fiches.clear()
-    finally:
-        conn.close()
+    
+    db_write(_delete_fiche)
+    # Invalider le cache
+    get_all_rcp.clear()
+    load_fiches.clear()
 
 
 # ---------------------------
@@ -740,13 +803,15 @@ def import_rcp_from_csv(uploaded_file, target_rcp_code: str) -> dict:
         if df.empty:
             return {"success": False, "message": "Le fichier CSV est vide."}
         
-        # Vérifier que la RCP cible existe
+        # Vérifier que la RCP cible existe (lecture seule)
         conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT code FROM rcp WHERE code = ?", (target_rcp_code,))
-        if cur.fetchone() is None:
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT code FROM rcp WHERE code = ?", (target_rcp_code,))
+            if cur.fetchone() is None:
+                return {"success": False, "message": f"La RCP {target_rcp_code} n'existe pas."}
+        finally:
             conn.close()
-            return {"success": False, "message": f"La RCP {target_rcp_code} n'existe pas."}
         
         imported_fiches = 0
         updated_fiches = 0
@@ -775,125 +840,143 @@ def import_rcp_from_csv(uploaded_file, target_rcp_code: str) -> dict:
         
         skipped_older = 0
         
-        # Récupérer toutes les fiches existantes en une seule requête pour optimiser
+        # Récupérer toutes les fiches existantes en une seule requête pour optimiser (lecture seule)
         existing_fiches = {}
         if not fiche_rows.empty and "id" in fiche_rows.columns:
             fiche_ids = [str(fid) for fid in fiche_rows["id"].dropna().unique()]
             if fiche_ids:
-                placeholders = ','.join(['?'] * len(fiche_ids))
-                cur.execute(f"SELECT id, updated_at FROM fiches WHERE id IN ({placeholders})", fiche_ids)
-                for row in cur.fetchall():
-                    existing_fiches[row[0]] = row[1]
+                conn = get_conn()
+                try:
+                    cur = conn.cursor()
+                    placeholders = ','.join(['?'] * len(fiche_ids))
+                    cur.execute(f"SELECT id, updated_at FROM fiches WHERE id IN ({placeholders})", fiche_ids)
+                    for row in cur.fetchall():
+                        existing_fiches[row[0]] = row[1]
+                finally:
+                    conn.close()
         
         # Traiter les fiches par batch
         batch_size = 50
         now = datetime.now().isoformat(timespec="seconds")
         
-        for i in range(0, len(fiche_rows), batch_size):
-            batch = fiche_rows.iloc[i:i+batch_size]
+        # Préparer les données de toutes les fiches
+        fiche_operations = []
+        
+        for _, row in fiche_rows.iterrows():
+            try:
+                fiche_id = row.get("id")
+                if pd.isna(fiche_id):
+                    continue
+                
+                fiche_id = str(fiche_id)
+                rcp_code = target_rcp_code
+                
+                # Reconstruire le payload depuis les colonnes
+                payload = {}
+                payload_fields = [
+                    "rcp_date", "chirurgien",
+                    "patiente_nom", "patiente_ddn", "poids_kg", "taille_cm", "imc",
+                    "iu_type", "severite_protections_j", "gene_10", "score_usp", "score_hav", "dysurie",
+                    "qmax_ml_s", "volume_urine_ml", "rpm_ml", "courbe_normale", "proposition_rcp"
+                ]
+                
+                for field in payload_fields:
+                    if field in row and not pd.isna(row[field]):
+                        payload[field] = str(row[field])
+                
+                # Antécédents
+                if "antecedents" in row and not pd.isna(row["antecedents"]):
+                    try:
+                        payload["antecedents"] = json.loads(str(row["antecedents"]))
+                    except:
+                        payload["antecedents"] = {}
+                else:
+                    antecedents = {}
+                    for col in df.columns:
+                        if col.startswith("antecedents."):
+                            key = col.replace("antecedents.", "")
+                            if not pd.isna(row[col]):
+                                antecedents[key] = str(row[col])
+                    payload["antecedents"] = antecedents if antecedents else {}
+                
+                # Examen
+                if "examen" in row and not pd.isna(row["examen"]):
+                    try:
+                        payload["examen"] = json.loads(str(row["examen"]))
+                    except:
+                        payload["examen"] = {}
+                else:
+                    examen = {}
+                    for col in df.columns:
+                        if col.startswith("examen."):
+                            key = col.replace("examen.", "")
+                            if not pd.isna(row[col]):
+                                examen[key] = str(row[col])
+                    payload["examen"] = examen if examen else {}
+                
+                created_at = row.get("created_at", now)
+                updated_at = row.get("updated_at", now)
+                
+                # Vérifier si la fiche existe
+                existing_updated_at = existing_fiches.get(fiche_id)
+                
+                operation = None
+                if existing_updated_at:
+                    # Comparer les dates (format ISO)
+                    try:
+                        existing_date = datetime.fromisoformat(existing_updated_at.replace("Z", "+00:00") if "Z" in existing_updated_at else existing_updated_at)
+                        new_date = datetime.fromisoformat(updated_at.replace("Z", "+00:00") if "Z" in updated_at else updated_at)
+                        
+                        # Ne mettre à jour que si la nouvelle date est plus récente
+                        if new_date > existing_date:
+                            operation = ("update", fiche_id, rcp_code, updated_at, payload)
+                        else:
+                            skipped_older += 1
+                    except Exception:
+                        # En cas d'erreur de parsing de date, mettre à jour quand même
+                        operation = ("update", fiche_id, rcp_code, updated_at, payload)
+                else:
+                    operation = ("insert", fiche_id, rcp_code, created_at, updated_at, payload)
+                
+                if operation:
+                    fiche_operations.append(operation)
+                    
+            except Exception as e:
+                errors.append(f"Erreur fiche {row.get('id', 'unknown')}: {str(e)}")
+        
+        # Traiter les opérations par batch avec db_write
+        for i in range(0, len(fiche_operations), batch_size):
+            batch = fiche_operations[i:i+batch_size]
             
-            for _, row in batch.iterrows():
-                try:
-                    fiche_id = row.get("id")
-                    if pd.isna(fiche_id):
-                        continue
-                    
-                    fiche_id = str(fiche_id)
-                    rcp_code = target_rcp_code
-                    
-                    # Reconstruire le payload depuis les colonnes
-                    payload = {}
-                    payload_fields = [
-                        "rcp_date", "chirurgien",
-                        "patiente_nom", "patiente_ddn", "poids_kg", "taille_cm", "imc",
-                        "iu_type", "severite_protections_j", "gene_10", "score_usp", "score_hav", "dysurie",
-                        "qmax_ml_s", "volume_urine_ml", "rpm_ml", "courbe_normale", "proposition_rcp"
-                    ]
-                    
-                    for field in payload_fields:
-                        if field in row and not pd.isna(row[field]):
-                            payload[field] = str(row[field])
-                    
-                    # Antécédents
-                    if "antecedents" in row and not pd.isna(row["antecedents"]):
-                        try:
-                            payload["antecedents"] = json.loads(str(row["antecedents"]))
-                        except:
-                            payload["antecedents"] = {}
-                    else:
-                        antecedents = {}
-                        for col in df.columns:
-                            if col.startswith("antecedents."):
-                                key = col.replace("antecedents.", "")
-                                if not pd.isna(row[col]):
-                                    antecedents[key] = str(row[col])
-                        payload["antecedents"] = antecedents if antecedents else {}
-                    
-                    # Examen
-                    if "examen" in row and not pd.isna(row["examen"]):
-                        try:
-                            payload["examen"] = json.loads(str(row["examen"]))
-                        except:
-                            payload["examen"] = {}
-                    else:
-                        examen = {}
-                        for col in df.columns:
-                            if col.startswith("examen."):
-                                key = col.replace("examen.", "")
-                                if not pd.isna(row[col]):
-                                    examen[key] = str(row[col])
-                        payload["examen"] = examen if examen else {}
-                    
-                    created_at = row.get("created_at", now)
-                    updated_at = row.get("updated_at", now)
-                    
-                    # Vérifier si la fiche existe
-                    existing_updated_at = existing_fiches.get(fiche_id)
-                    
-                    if existing_updated_at:
-                        # Comparer les dates (format ISO)
-                        try:
-                            existing_date = datetime.fromisoformat(existing_updated_at.replace("Z", "+00:00") if "Z" in existing_updated_at else existing_updated_at)
-                            new_date = datetime.fromisoformat(updated_at.replace("Z", "+00:00") if "Z" in updated_at else updated_at)
-                            
-                            # Ne mettre à jour que si la nouvelle date est plus récente
-                            if new_date > existing_date:
-                                cur.execute(
-                                    "UPDATE fiches SET rcp_code = ?, updated_at = ?, payload_json = ? WHERE id = ?",
-                                    (rcp_code, updated_at, json.dumps(payload, ensure_ascii=False), fiche_id)
-                                )
-                                updated_fiches += 1
-                            else:
-                                skipped_older += 1
-                        except Exception:
-                            # En cas d'erreur de parsing de date, mettre à jour quand même
-                            cur.execute(
-                                "UPDATE fiches SET rcp_code = ?, updated_at = ?, payload_json = ? WHERE id = ?",
-                                (rcp_code, updated_at, json.dumps(payload, ensure_ascii=False), fiche_id)
-                            )
-                            updated_fiches += 1
-                    else:
+            def _process_batch(conn, cur):
+                nonlocal imported_fiches, updated_fiches
+                for op in batch:
+                    if op[0] == "update":
+                        _, fiche_id, rcp_code, updated_at, payload = op
+                        cur.execute(
+                            "UPDATE fiches SET rcp_code = ?, updated_at = ?, payload_json = ? WHERE id = ?",
+                            (rcp_code, updated_at, json.dumps(payload, ensure_ascii=False), fiche_id)
+                        )
+                        updated_fiches += 1
+                    elif op[0] == "insert":
+                        _, fiche_id, rcp_code, created_at, updated_at, payload = op
                         cur.execute(
                             "INSERT INTO fiches (id, rcp_code, created_at, updated_at, payload_json) VALUES (?, ?, ?, ?, ?)",
                             (fiche_id, rcp_code, created_at, updated_at, json.dumps(payload, ensure_ascii=False))
                         )
                         imported_fiches += 1
-                    
-                except Exception as e:
-                    errors.append(f"Erreur fiche {fiche_id}: {str(e)}")
             
-            # Commit par batch pour améliorer les performances
-            conn.commit()
+            db_write(_process_batch)
         
         # Mettre à jour la date de modification de la RCP une seule fois à la fin
         if imported_fiches > 0 or updated_fiches > 0:
-            cur.execute("UPDATE rcp SET updated_at = ? WHERE code = ?", (now, target_rcp_code))
-            conn.commit()
+            def _update_rcp_date(conn, cur):
+                cur.execute("UPDATE rcp SET updated_at = ? WHERE code = ?", (now, target_rcp_code))
+            
+            db_write(_update_rcp_date)
             # Invalider le cache
             get_all_rcp.clear()
             load_fiches.clear()
-        
-        conn.close()
         
         message = f"Import terminé: {imported_fiches} fiches créées, {updated_fiches} fiches mises à jour dans la RCP {target_rcp_code}."
         if skipped_older > 0:
